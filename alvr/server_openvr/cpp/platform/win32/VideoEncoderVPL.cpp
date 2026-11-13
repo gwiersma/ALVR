@@ -80,11 +80,19 @@ void VideoEncoderVPL::Transmit(
                 static_cast<double>(dynParams.bitrate_bps) / dynParams.framerate * m_refreshRate
             );
         }
-        SetBitrate(bitrateBps);
-
-        mfxStatus sts = MFXVideoENCODE_Reset(m_vplSession, &m_vplEncodeParams);
-        if (sts < MFX_ERR_NONE) {
-            VPL_WARN("failed to update bitrate to %llu bps (error %d)", bitrateBps, sts);
+        if (SetBitrate(bitrateBps)) {
+            mfxStatus sts = MFXVideoENCODE_Reset(m_vplSession, &m_vplEncodeParams);
+            if (sts < MFX_ERR_NONE) {
+                // Reset can't grow internal buffers (MFX_ERR_INCOMPATIBLE_VIDEO_PARAM). The spec
+                // says to close and reinitialize the encoder in that case. This starts a new
+                // sequence, so the next frame is an IDR.
+                VPL_INFO(
+                    "reinitializing encoder for bitrate %llu bps (reset error %d)", bitrateBps, sts
+                );
+                MFXVideoENCODE_Close(m_vplSession);
+                VPL_VERIFY(MFXVideoENCODE_Init(m_vplSession, &m_vplEncodeParams));
+                insertIDR = true;
+            }
         }
     }
 
@@ -201,7 +209,7 @@ void VideoEncoderVPL::InitVplEncode() {
     m_vplEncodeParams.mfx.CodecProfile = m_vplCodecProfile;
     m_vplEncodeParams.mfx.TargetUsage = m_vplQualityPreset;
     m_vplEncodeParams.mfx.RateControlMethod = m_vplRateControlMode;
-    SetBitrate(static_cast<uint64_t>(m_bitrateInMBits) * 1'000'000);
+    SetBitrate(static_cast<uint64_t>(m_bitrateInMBits) * 1'000'000, true);
     // Low latency streaming: no B-frames, so every frame can be sent as soon as it is encoded.
     m_vplEncodeParams.mfx.GopRefDist = 1;
     m_vplEncodeParams.mfx.FrameInfo.FrameRateExtN = m_refreshRate;
@@ -231,39 +239,56 @@ void VideoEncoderVPL::InitVplEncode() {
     VPL_VERIFY(MFXVideoENCODE_Init(m_vplSession, &m_vplEncodeParams));
 }
 
-void VideoEncoderVPL::SetBitrate(uint64_t bitrateBps) {
+bool VideoEncoderVPL::SetBitrate(uint64_t bitrateBps, bool forInit) {
     // TargetKbps, MaxKbps, BufferSizeInKB and InitialDelayInKB are 16-bit fields, so anything above
-    // ~65 Mbps silently wraps around. VPL scales all of them by BRCParamMultiplier, so pick the
-    // smallest multiplier that keeps the target bitrate in range.
+    // ~65 Mbps silently wraps around. VPL scales all of them by BRCParamMultiplier.
+    //
+    // The multiplier is derived from a fixed maximum bitrate so it never changes between
+    // MFXVideoENCODE_Reset calls, and the encoder is initialized with rate control buffers sized
+    // for that maximum. Reset can only shrink those buffers; growing them past the size used at
+    // Init fails with MFX_ERR_INCOMPATIBLE_VIDEO_PARAM.
     constexpr uint64_t MAX_U16 = 0xFFFF;
-    mfxInfoMFX& mfx = m_vplEncodeParams.mfx;
+    constexpr uint64_t MAX_BITRATE_BPS = 1'000'000'000; // Same limit as AMF
+    constexpr uint64_t MULTIPLIER = (MAX_BITRATE_BPS / 1000 + MAX_U16 - 1) / MAX_U16;
 
-    uint64_t kbps = bitrateBps / 1000;
-    if (kbps == 0) {
-        kbps = 1;
+    if (bitrateBps > MAX_BITRATE_BPS) {
+        bitrateBps = MAX_BITRATE_BPS;
     }
-    uint64_t multiplier = (kbps + MAX_U16 - 1) / MAX_U16;
-    if (multiplier > MAX_U16) {
-        multiplier = MAX_U16;
+    if (bitrateBps < 1000 * MULTIPLIER) {
+        bitrateBps = 1000 * MULTIPLIER;
     }
 
-    // Keep the buffer fields (possibly filled in by MFXVideoENCODE_Query) at the same absolute
-    // size when the multiplier changes.
-    uint64_t oldMultiplier = mfx.BRCParamMultiplier == 0 ? 1 : mfx.BRCParamMultiplier;
-    auto rescale = [&](mfxU16 value) -> mfxU16 {
-        uint64_t absolute = static_cast<uint64_t>(value) * oldMultiplier;
-        uint64_t scaled = (absolute + multiplier - 1) / multiplier;
+    auto toField = [&](uint64_t kiloUnits) -> mfxU16 {
+        uint64_t scaled = kiloUnits / MULTIPLIER;
+        if (scaled == 0) {
+            scaled = 1;
+        }
         return static_cast<mfxU16>(scaled > MAX_U16 ? MAX_U16 : scaled);
     };
-    mfx.BufferSizeInKB = rescale(mfx.BufferSizeInKB);
-    if (mfx.RateControlMethod != MFX_RATECONTROL_CQP) {
-        mfx.InitialDelayInKB = rescale(mfx.InitialDelayInKB);
-        mfx.MaxKbps = rescale(mfx.MaxKbps);
-    }
 
-    uint64_t target = kbps / multiplier;
-    mfx.BRCParamMultiplier = static_cast<mfxU16>(multiplier);
-    mfx.TargetKbps = static_cast<mfxU16>(target > MAX_U16 ? MAX_U16 : target);
+    // Size the buffer for about one frame, like the AMF and NVENC encoders, for low latency.
+    uint64_t bufferBps = forInit ? MAX_BITRATE_BPS : bitrateBps;
+    uint64_t refreshRate = m_refreshRate > 0 ? static_cast<uint64_t>(m_refreshRate) : 60;
+    uint64_t bufferKB = bufferBps / 8 / refreshRate * 11 / 10 / 1000;
+
+    mfxInfoMFX& mfx = m_vplEncodeParams.mfx;
+    mfxU16 targetKbps = toField(bitrateBps / 1000);
+    // CBR uses MaxKbps = TargetKbps. VBR (and the Init call, so Reset never has to grow it) uses
+    // the maximum.
+    bool useMax = forInit || mfx.RateControlMethod == MFX_RATECONTROL_VBR;
+    mfxU16 maxKbps = useMax ? toField(MAX_BITRATE_BPS / 1000) : targetKbps;
+    mfxU16 bufferSizeInKB = toField(bufferKB);
+
+    bool changed = mfx.BRCParamMultiplier != MULTIPLIER || mfx.TargetKbps != targetKbps
+        || mfx.MaxKbps != maxKbps || mfx.BufferSizeInKB != bufferSizeInKB;
+
+    mfx.BRCParamMultiplier = static_cast<mfxU16>(MULTIPLIER);
+    mfx.TargetKbps = targetKbps;
+    mfx.MaxKbps = maxKbps;
+    mfx.BufferSizeInKB = bufferSizeInKB;
+    mfx.InitialDelayInKB = bufferSizeInKB;
+
+    return changed;
 }
 
 mfxFrameSurface1* VideoEncoderVPL::VplImportTexture(ID3D11Texture2D* texture) {

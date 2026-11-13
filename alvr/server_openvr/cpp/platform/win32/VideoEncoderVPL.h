@@ -37,7 +37,8 @@ private:
     void InitTransferTex();
     void InitVpl();
     void InitVplEncode();
-    void SetBitrate(uint64_t bitrateBps);
+    // Returns true if any rate control parameter changed.
+    bool SetBitrate(uint64_t bitrateBps, bool forInit = false);
     mfxFrameSurface1* VplImportTexture(ID3D11Texture2D* texture);
     void LogImplementationInfo();
 
