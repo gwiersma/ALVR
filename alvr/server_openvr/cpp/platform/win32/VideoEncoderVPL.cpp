@@ -224,6 +224,28 @@ void VideoEncoderVPL::InitVplEncode() {
     m_vplExtBuffers[0] = &m_vplCodingOption.Header;
     m_vplEncodeParams.ExtParam = m_vplExtBuffers;
     m_vplEncodeParams.NumExtParam = 1;
+
+    // Extra quality and latency hints for AVC/HEVC. If the driver rejects them, Query is retried
+    // without them below.
+    if (m_vplCodec == MFX_CODEC_AVC || m_vplCodec == MFX_CODEC_HEVC) {
+        // Macroblock level rate control: Intel's equivalent of AMD VBAQ / NVENC adaptive
+        // quantization, controlled by the same setting.
+        m_vplCodingOption2.Header.BufferId = MFX_EXTBUFF_CODING_OPTION2;
+        m_vplCodingOption2.Header.BufferSz = sizeof(m_vplCodingOption2);
+        m_vplCodingOption2.MBBRC
+            = Settings_Instance()->m_enableVbaq ? MFX_CODINGOPTION_ON : MFX_CODINGOPTION_UNKNOWN;
+
+        // Tell the driver this is a low latency game stream, and let it pick quantization
+        // matrices per frame for better subjective quality.
+        m_vplCodingOption3.Header.BufferId = MFX_EXTBUFF_CODING_OPTION3;
+        m_vplCodingOption3.Header.BufferSz = sizeof(m_vplCodingOption3);
+        m_vplCodingOption3.ScenarioInfo = MFX_SCENARIO_REMOTE_GAMING;
+        m_vplCodingOption3.AdaptiveCQM = MFX_CODINGOPTION_ON;
+
+        m_vplExtBuffers[1] = &m_vplCodingOption2.Header;
+        m_vplExtBuffers[2] = &m_vplCodingOption3.Header;
+        m_vplEncodeParams.NumExtParam = 3;
+    }
     // Low latency streaming: no B-frames, so every frame can be sent as soon as it is encoded.
     m_vplEncodeParams.mfx.GopRefDist = 1;
     m_vplEncodeParams.mfx.FrameInfo.FrameRateExtN = m_refreshRate;
@@ -235,7 +257,19 @@ void VideoEncoderVPL::InitVplEncode() {
     m_vplEncodeParams.mfx.FrameInfo.Width = ALIGN16(m_renderWidth);
     m_vplEncodeParams.mfx.FrameInfo.Height = ALIGN16(m_renderHeight);
 
+    // A failed Query may zero fields of the output, so keep a copy to retry from.
+    mfxVideoParam queryInput = m_vplEncodeParams;
+    mfxExtCodingOption codingOptionInput = m_vplCodingOption;
     mfxStatus sts = MFXVideoENCODE_Query(m_vplSession, &m_vplEncodeParams, &m_vplEncodeParams);
+    if (sts < MFX_ERR_NONE && queryInput.NumExtParam > 1) {
+        VPL_WARN("extra encoder options rejected (error %d), retrying without them", sts);
+        m_vplEncodeParams = queryInput;
+        m_vplCodingOption = codingOptionInput;
+        m_vplEncodeParams.NumExtParam = 1;
+        m_vplCodingOption2 = {};
+        m_vplCodingOption3 = {};
+        sts = MFXVideoENCODE_Query(m_vplSession, &m_vplEncodeParams, &m_vplEncodeParams);
+    }
     switch (sts) {
     case MFX_WRN_INCOMPATIBLE_VIDEO_PARAM:
         VPL_WARN("incompatible video params, auto-correcting");
@@ -259,6 +293,13 @@ void VideoEncoderVPL::InitVplEncode() {
         static_cast<unsigned>(mfx.CodecLevel),
         static_cast<unsigned>(m_vplCodingOption.NalHrdConformance)
     );
+    VPL_INFO(
+        "options: low power %u, MBBRC %u, adaptive CQM %u, scenario %u",
+        static_cast<unsigned>(mfx.LowPower),
+        static_cast<unsigned>(m_vplCodingOption2.MBBRC),
+        static_cast<unsigned>(m_vplCodingOption3.AdaptiveCQM),
+        static_cast<unsigned>(m_vplCodingOption3.ScenarioInfo)
+    );
 
     InitEncoder();
 }
@@ -267,6 +308,13 @@ void VideoEncoderVPL::InitEncoder() {
     // Positive status codes are warnings (e.g. MFX_WRN_INCOMPATIBLE_VIDEO_PARAM: parameters were
     // adjusted) and still mean success.
     mfxStatus sts = MFXVideoENCODE_Init(m_vplSession, &m_vplEncodeParams);
+    if (sts < MFX_ERR_NONE && m_vplEncodeParams.NumExtParam > 1) {
+        VPL_WARN("init failed with extra encoder options (error %d), retrying without them", sts);
+        m_vplEncodeParams.NumExtParam = 1;
+        m_vplCodingOption2 = {};
+        m_vplCodingOption3 = {};
+        sts = MFXVideoENCODE_Init(m_vplSession, &m_vplEncodeParams);
+    }
     if (sts < MFX_ERR_NONE) {
         ERROR_THROW("\"MFXVideoENCODE_Init\" failed with %d", sts);
     } else if (sts > MFX_ERR_NONE) {

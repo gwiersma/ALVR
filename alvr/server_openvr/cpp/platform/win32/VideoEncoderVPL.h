@@ -61,7 +61,9 @@ private:
     DXGI_FORMAT m_dxColorFormat;
     mfxVideoParam m_vplEncodeParams = {};
     mfxExtCodingOption m_vplCodingOption = {};
-    mfxExtBuffer* m_vplExtBuffers[1] = {};
+    mfxExtCodingOption2 m_vplCodingOption2 = {};
+    mfxExtCodingOption3 m_vplCodingOption3 = {};
+    mfxExtBuffer* m_vplExtBuffers[3] = {};
 
     mfxLoader m_vplLoader = nullptr;
     mfxSession m_vplSession = nullptr;
