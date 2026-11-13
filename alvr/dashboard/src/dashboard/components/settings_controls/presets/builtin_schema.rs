@@ -116,8 +116,7 @@ pub fn codec_preset_schema() -> PresetSchemaNode {
             (
             "notice".into(),
             "AV1 encoding is only supported on RDNA3, Ada Lovelace, Intel ARC or newer GPUs (AMD RX 7xxx+ , NVIDIA RTX 40xx+, Intel ARC)
-and on headsets that have XR2 Gen 2 onboard (Quest 3, Pico 4 Ultra).\n
-H264 encoding is currently NOT supported on Intel ARC GPUs on Windows."
+and on headsets that have XR2 Gen 2 onboard (Quest 3, Pico 4 Ultra)."
                 .into(),
             ),
         ]

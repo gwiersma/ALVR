@@ -37,6 +37,7 @@ private:
     void InitTransferTex();
     void InitVpl();
     void InitVplEncode();
+    void SetBitrate(uint64_t bitrateBps);
     mfxFrameSurface1* VplImportTexture(ID3D11Texture2D* texture);
     void LogImplementationInfo();
 

@@ -72,14 +72,30 @@ void VideoEncoderVPL::Transmit(
 
     auto dynParams = GetDynamicEncoderParams();
     if (dynParams.updated) {
-        m_vplEncodeParams.mfx.TargetKbps = dynParams.bitrate_bps / 1000;
-        MFXVideoENCODE_Reset(m_vplSession, &m_vplEncodeParams);
+        // The encoder is configured with a fixed frame rate (m_refreshRate), so scale the bitrate
+        // to keep the requested bits per frame when the actual frame rate differs (same as AMF).
+        uint64_t bitrateBps = dynParams.bitrate_bps;
+        if (dynParams.framerate > 0.0f) {
+            bitrateBps = static_cast<uint64_t>(
+                static_cast<double>(dynParams.bitrate_bps) / dynParams.framerate * m_refreshRate
+            );
+        }
+        SetBitrate(bitrateBps);
+
+        mfxStatus sts = MFXVideoENCODE_Reset(m_vplSession, &m_vplEncodeParams);
+        if (sts < MFX_ERR_NONE) {
+            VPL_WARN("failed to update bitrate to %llu bps (error %d)", bitrateBps, sts);
+        }
     }
 
     auto encSurface = VplImportTexture(pTexture);
 
     mfxEncodeCtrl encodeCtrl = {};
-    encodeCtrl.FrameType = insertIDR ? MFX_FRAMETYPE_IDR : 0;
+    // An IDR request must also carry the frame type it applies to (I) and mark the frame as a
+    // reference. Passing MFX_FRAMETYPE_IDR on its own is rejected by the AVC encoder with
+    // MFX_ERR_INVALID_VIDEO_PARAM.
+    encodeCtrl.FrameType = insertIDR ? (MFX_FRAMETYPE_I | MFX_FRAMETYPE_REF | MFX_FRAMETYPE_IDR)
+                                     : MFX_FRAMETYPE_UNKNOWN;
 
     mfxStatus sts = MFX_ERR_NONE;
     mfxSyncPoint syncp = {};
@@ -184,8 +200,10 @@ void VideoEncoderVPL::InitVplEncode() {
     m_vplEncodeParams.mfx.CodecId = m_vplCodec;
     m_vplEncodeParams.mfx.CodecProfile = m_vplCodecProfile;
     m_vplEncodeParams.mfx.TargetUsage = m_vplQualityPreset;
-    m_vplEncodeParams.mfx.TargetKbps = m_bitrateInMBits * 1000;
     m_vplEncodeParams.mfx.RateControlMethod = m_vplRateControlMode;
+    SetBitrate(static_cast<uint64_t>(m_bitrateInMBits) * 1'000'000);
+    // Low latency streaming: no B-frames, so every frame can be sent as soon as it is encoded.
+    m_vplEncodeParams.mfx.GopRefDist = 1;
     m_vplEncodeParams.mfx.FrameInfo.FrameRateExtN = m_refreshRate;
     m_vplEncodeParams.mfx.FrameInfo.FrameRateExtD = 1;
     m_vplEncodeParams.mfx.FrameInfo.FourCC = m_vplColorFormat;
@@ -211,6 +229,41 @@ void VideoEncoderVPL::InitVplEncode() {
 
     // Initialize ENCODE
     VPL_VERIFY(MFXVideoENCODE_Init(m_vplSession, &m_vplEncodeParams));
+}
+
+void VideoEncoderVPL::SetBitrate(uint64_t bitrateBps) {
+    // TargetKbps, MaxKbps, BufferSizeInKB and InitialDelayInKB are 16-bit fields, so anything above
+    // ~65 Mbps silently wraps around. VPL scales all of them by BRCParamMultiplier, so pick the
+    // smallest multiplier that keeps the target bitrate in range.
+    constexpr uint64_t MAX_U16 = 0xFFFF;
+    mfxInfoMFX& mfx = m_vplEncodeParams.mfx;
+
+    uint64_t kbps = bitrateBps / 1000;
+    if (kbps == 0) {
+        kbps = 1;
+    }
+    uint64_t multiplier = (kbps + MAX_U16 - 1) / MAX_U16;
+    if (multiplier > MAX_U16) {
+        multiplier = MAX_U16;
+    }
+
+    // Keep the buffer fields (possibly filled in by MFXVideoENCODE_Query) at the same absolute
+    // size when the multiplier changes.
+    uint64_t oldMultiplier = mfx.BRCParamMultiplier == 0 ? 1 : mfx.BRCParamMultiplier;
+    auto rescale = [&](mfxU16 value) -> mfxU16 {
+        uint64_t absolute = static_cast<uint64_t>(value) * oldMultiplier;
+        uint64_t scaled = (absolute + multiplier - 1) / multiplier;
+        return static_cast<mfxU16>(scaled > MAX_U16 ? MAX_U16 : scaled);
+    };
+    mfx.BufferSizeInKB = rescale(mfx.BufferSizeInKB);
+    if (mfx.RateControlMethod != MFX_RATECONTROL_CQP) {
+        mfx.InitialDelayInKB = rescale(mfx.InitialDelayInKB);
+        mfx.MaxKbps = rescale(mfx.MaxKbps);
+    }
+
+    uint64_t target = kbps / multiplier;
+    mfx.BRCParamMultiplier = static_cast<mfxU16>(multiplier);
+    mfx.TargetKbps = static_cast<mfxU16>(target > MAX_U16 ? MAX_U16 : target);
 }
 
 mfxFrameSurface1* VideoEncoderVPL::VplImportTexture(ID3D11Texture2D* texture) {
@@ -239,19 +292,6 @@ void VideoEncoderVPL::ChooseParams() {
 
     m_refreshRate = s->m_refreshRate;
     m_codec = s->m_codec;
-
-    // h264 encoding is currently broken due to an encoding
-    // error when forcing the idr frame type:
-    //
-    // mfxEncodeCtrl encodeCtrl = {};
-    // encodeCtrl.FrameType = MFX_FRAMETYPE_IDR;
-    //
-    // Results in error -15 (MFX_ERR_INVALID_VIDEO_PARAM)
-    // when encoding a frame.
-    if (m_codec == ALVR_CODEC_H264) {
-        VPL_WARN("h264 codec currently unsupported, forcing HEVC");
-        m_codec = ALVR_CODEC_HEVC;
-    }
 
     if (s->m_enableHdr) {
         if (s->m_use10bitEncoder) {

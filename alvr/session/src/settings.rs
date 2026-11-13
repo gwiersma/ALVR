@@ -236,7 +236,7 @@ pub struct EncoderConfig {
     #[schema(flag = "steamvr-restart")]
     #[schema(strings(
         display_name = "Quality preset",
-        help = "Controls overall quality preset of the encoder. Works only on Windows AMD AMF, Linux VAAPI (AMD/Intel)."
+        help = "Controls overall quality preset of the encoder. Works only on Windows AMD AMF, Windows Intel VPL, Linux VAAPI (AMD/Intel)."
     ))]
     pub quality_preset: EncoderQualityPreset,
 
@@ -251,7 +251,7 @@ pub struct EncoderConfig {
 
     #[cfg_attr(not(target_os = "windows"), schema(flag = "hidden"))]
     #[schema(strings(help = r#"CBR: Constant BitRate mode. This is recommended.
-VBR: Variable BitRate mode. Not commended because it may throw off the adaptive bitrate algorithm. This is only supported on Windows and only with AMD/Nvidia GPUs"#))]
+VBR: Variable BitRate mode. Not commended because it may throw off the adaptive bitrate algorithm. This is only supported on Windows and only with AMD/Nvidia/Intel GPUs"#))]
     #[schema(flag = "steamvr-restart")]
     pub rate_control_mode: RateControlMode,
 
