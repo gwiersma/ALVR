@@ -52,6 +52,7 @@ private:
     uint64_t m_appliedBitrateBps = 0;
     mfxU16 m_brcMultiplier = 0;
     mfxU16 m_initMaxKbps = 0;
+    mfxU16 m_initTargetKbps = 0;
     mfxU16 m_initBufferSizeInKB = 0;
 
     mfxU32 m_vplCodec;

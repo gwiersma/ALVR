@@ -84,15 +84,16 @@ void VideoEncoderVPL::Transmit(
         uint64_t applied = m_appliedBitrateBps;
         bool significant = applied == 0 || bitrateBps > applied + applied / 10
             || bitrateBps < applied - applied / 10;
+        mfxVideoParam previousParams = m_vplEncodeParams;
         if (significant && SetBitrate(bitrateBps)) {
             m_appliedBitrateBps = bitrateBps;
 
-            // Allow the encoder to start a new sequence (IDR) if the change needs one, e.g. a
-            // different level.
+            // Keep the current sequence: a new one could change the SPS/PPS, which ALVR only sends
+            // to the client at stream start or when the client asks for an IDR.
             mfxExtEncoderResetOption resetOption = {};
             resetOption.Header.BufferId = MFX_EXTBUFF_ENCODER_RESET_OPTION;
             resetOption.Header.BufferSz = sizeof(resetOption);
-            resetOption.StartNewSequence = MFX_CODINGOPTION_UNKNOWN;
+            resetOption.StartNewSequence = MFX_CODINGOPTION_OFF;
             mfxExtBuffer* extBuffers[] = { &resetOption.Header };
             mfxVideoParam resetParams = m_vplEncodeParams;
             resetParams.ExtParam = extBuffers;
@@ -100,20 +101,9 @@ void VideoEncoderVPL::Transmit(
 
             mfxStatus sts = MFXVideoENCODE_Reset(m_vplSession, &resetParams);
             if (sts < MFX_ERR_NONE) {
-                // MFX_ERR_INCOMPATIBLE_VIDEO_PARAM: the change needs new allocations. The spec
-                // says to close and reinitialize the encoder. The next frame is then an IDR.
-                VPL_INFO(
-                    "reinitializing encoder for bitrate %llu bps (reset error %d)", bitrateBps, sts
-                );
-                // Allocate buffers for the maximum again, so later changes can use Reset.
-                if (m_vplEncodeParams.mfx.RateControlMethod == MFX_RATECONTROL_VBR) {
-                    m_vplEncodeParams.mfx.MaxKbps = m_initMaxKbps;
-                }
-                m_vplEncodeParams.mfx.BufferSizeInKB = m_initBufferSizeInKB;
-                m_vplEncodeParams.mfx.InitialDelayInKB = m_initBufferSizeInKB;
-                MFXVideoENCODE_Close(m_vplSession);
-                InitEncoder();
-                insertIDR = true;
+                // The encoder keeps running with its previous parameters.
+                VPL_WARN("failed to update bitrate to %llu bps (error %d)", bitrateBps, sts);
+                m_vplEncodeParams = previousParams;
             }
         }
     }
@@ -231,7 +221,11 @@ void VideoEncoderVPL::InitVplEncode() {
     m_vplEncodeParams.mfx.CodecProfile = m_vplCodecProfile;
     m_vplEncodeParams.mfx.TargetUsage = m_vplQualityPreset;
     m_vplEncodeParams.mfx.RateControlMethod = m_vplRateControlMode;
-    SetBitrate(static_cast<uint64_t>(m_bitrateInMBits) * 1'000'000, true);
+    // Start at the maximum bitrate: the encoder picks its level (and tier) from the bitrate at
+    // Init, and Reset can't move to a higher level later (MFX_ERR_INCOMPATIBLE_VIDEO_PARAM).
+    // Lowering the bitrate with Reset always works. The first Transmit call applies the real
+    // bitrate.
+    SetBitrate(0, true);
     // Low latency streaming: no B-frames, so every frame can be sent as soon as it is encoded.
     m_vplEncodeParams.mfx.GopRefDist = 1;
     m_vplEncodeParams.mfx.FrameInfo.FrameRateExtN = m_refreshRate;
@@ -262,6 +256,7 @@ void VideoEncoderVPL::InitVplEncode() {
     const mfxInfoMFX& mfx = m_vplEncodeParams.mfx;
     m_brcMultiplier = mfx.BRCParamMultiplier == 0 ? 1 : mfx.BRCParamMultiplier;
     m_initMaxKbps = mfx.MaxKbps;
+    m_initTargetKbps = mfx.TargetKbps;
     m_initBufferSizeInKB = mfx.BufferSizeInKB;
     VPL_INFO(
         "rate control: target %u kbps, max %u kbps, buffer %u KB, multiplier %u, level %u",
@@ -306,6 +301,10 @@ bool VideoEncoderVPL::SetBitrate(uint64_t bitrateBps, bool forInit) {
         bitrateBps = 1000 * MULTIPLIER;
     }
 
+    if (forInit) {
+        bitrateBps = MAX_BITRATE_BPS;
+    }
+
     auto toField = [&](uint64_t kiloUnits) -> mfxU16 {
         uint64_t scaled = kiloUnits / MULTIPLIER;
         if (scaled == 0) {
@@ -327,6 +326,13 @@ bool VideoEncoderVPL::SetBitrate(uint64_t bitrateBps, bool forInit) {
     mfxU16 maxKbps = useMax ? toField(MAX_BITRATE_BPS / 1000) : targetKbps;
     mfxU16 bufferSizeInKB = toField(bufferKB);
     if (!forInit) {
+        // Never go above the bitrate the encoder accepted at Init, it would need a higher level.
+        if (m_initTargetKbps != 0 && targetKbps > m_initTargetKbps) {
+            targetKbps = m_initTargetKbps;
+            if (!useMax) {
+                maxKbps = targetKbps;
+            }
+        }
         // Never grow past what the encoder accepted at Init. (For CBR, MaxKbps follows the
         // target, so it is not limited here.)
         if (useMax && m_initMaxKbps != 0 && maxKbps > m_initMaxKbps) {
