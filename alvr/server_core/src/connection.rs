@@ -44,6 +44,7 @@ use std::{
 };
 
 const RETRY_CONNECT_MIN_INTERVAL: Duration = Duration::from_secs(1);
+const WIRED_MAX_FAILED_ATTEMPTS: u32 = 5;
 const HANDSHAKE_ACTION_TIMEOUT: Duration = Duration::from_secs(2);
 pub const STREAMING_RECV_TIMEOUT: Duration = Duration::from_millis(500);
 const REAL_TIME_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
@@ -268,6 +269,9 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
     };
 
     let mut wired_connection = None;
+    // Consecutive failed connection attempts to a wired client that reported itself ready.
+    let mut wired_failed_attempts = 0;
+    let mut wired_restart_info = None;
 
     while *lifecycle_state.read() != LifecycleState::ShuttingDown {
         dbg_connection!("handshake_loop: Try connect to wired device");
@@ -324,7 +328,7 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
                 CONTROL_PORT,
                 stream_port,
                 &client_type,
-                client_autolaunch,
+                client_autolaunch.clone(),
             ) {
                 Ok(status) => status,
                 Err(e) => {
@@ -337,24 +341,42 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
             #[cfg_attr(not(debug_assertions), expect(unused_variables))]
             if let WiredConnectionStatus::NotReady(s) = status {
                 dbg_connection!("handshake_loop: Wired connection not ready: {s}");
+                wired_failed_attempts = 0;
                 thread::sleep(RETRY_CONNECT_MIN_INTERVAL);
                 continue;
             }
+
+            wired_restart_info = client_autolaunch.is_some().then(|| client_type.clone());
 
             let client_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
             wired_client_ips.insert(client_ip, WIRED_CLIENT_HOSTNAME.to_owned());
         }
 
-        if !wired_client_ips.is_empty()
-            && try_connect(
+        if !wired_client_ips.is_empty() {
+            if try_connect(
                 Arc::clone(&ctx),
                 Arc::clone(&lifecycle_state),
                 wired_client_ips,
             )
             .is_ok()
-        {
-            thread::sleep(RETRY_CONNECT_MIN_INTERVAL);
-            continue;
+            {
+                wired_failed_attempts = 0;
+                thread::sleep(RETRY_CONNECT_MIN_INTERVAL);
+                continue;
+            }
+
+            // The client app is in the foreground and the ports are forwarded, but it doesn't
+            // accept the connection. Restart it after a few attempts (if autolaunch is enabled).
+            wired_failed_attempts += 1;
+            if wired_failed_attempts >= WIRED_MAX_FAILED_ATTEMPTS {
+                wired_failed_attempts = 0;
+                if let (Some(connection), Some(client_type)) =
+                    (&wired_connection, &wired_restart_info)
+                    && let Err(e) = connection.restart_client(client_type)
+                {
+                    error!("{e:?}");
+                }
+            }
         }
 
         dbg_connection!("handshake_loop: Try connect to manual IPs");

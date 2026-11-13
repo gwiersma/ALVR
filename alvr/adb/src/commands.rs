@@ -195,6 +195,28 @@ pub fn start_application(adb_path: &str, device_serial: &str, application_id: &s
     Ok(())
 }
 
+pub fn force_stop_application(
+    adb_path: &str,
+    device_serial: &str,
+    application_id: &str,
+) -> Result<()> {
+    get_command(
+        adb_path,
+        &[
+            "-s",
+            device_serial,
+            "shell",
+            "am",
+            "force-stop",
+            application_id,
+        ],
+    )
+    .output()
+    .context(format!("Failed to stop {application_id}"))?;
+
+    Ok(())
+}
+
 //////////
 // Devices
 

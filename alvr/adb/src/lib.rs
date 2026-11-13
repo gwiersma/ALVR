@@ -122,6 +122,31 @@ impl WiredConnection {
     }
 }
 
+impl WiredConnection {
+    /// Force-stops and restarts the client app. Used when the app is running and in the foreground
+    /// but doesn't accept connections, which happens after SteamVR was restarted without the
+    /// client being notified (crash, or restart from inside a game).
+    pub fn restart_client(&self, client_type: &ClientFlavor) -> Result<()> {
+        let Some(device_serial) = commands::list_devices(&self.adb_path)?
+            .into_iter()
+            .filter_map(|d| d.serial)
+            .find(|s| !s.starts_with("127.0.0.1"))
+        else {
+            return Ok(());
+        };
+        let Some(process_name) = get_process_name(&self.adb_path, &device_serial, client_type)
+        else {
+            return Ok(());
+        };
+
+        warn!("wired_connection: client is not responding, restarting {process_name}");
+        commands::force_stop_application(&self.adb_path, &device_serial, &process_name)?;
+        commands::start_application(&self.adb_path, &device_serial, &process_name)?;
+
+        Ok(())
+    }
+}
+
 impl Drop for WiredConnection {
     fn drop(&mut self) {
         dbg_connection!("wired_connection: Killing ADB server");
