@@ -36,6 +36,10 @@ impl WiredConnection {
         client_type: &ClientFlavor,
         client_autolaunch: Option<WiredClientAutoLaunchConfig>,
     ) -> Result<WiredConnectionStatus> {
+        // Start the server explicitly before any other command, so it is never spawned implicitly
+        // by a command that inherits our handles (see commands::start_server).
+        commands::start_server(&self.adb_path)?;
+
         let Some(device_serial) = commands::list_devices(&self.adb_path)?
             .into_iter()
             .filter_map(|d| d.serial)

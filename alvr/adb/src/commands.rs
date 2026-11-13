@@ -340,6 +340,84 @@ pub fn forward_port(adb_path: &str, device_serial: &str, port: u16) -> Result<()
 /////////
 // Server
 
+/// Makes sure the ADB server (daemon) is running.
+///
+/// On Windows, `std::process::Command` always creates the child with handle inheritance enabled,
+/// so an ADB server started by an implicit `adb <command>` call inherits every inheritable handle
+/// of the calling process. When ALVR runs inside vrserver.exe, that includes SteamVR's listening
+/// socket on port 27062. The ADB server outlives vrserver (and is not cleaned up on a crash), so
+/// SteamVR can't be restarted until adb.exe is killed. To avoid this, start the server explicitly
+/// from a process created without handle inheritance; later short-lived `adb` commands will reuse
+/// this server instead of spawning their own.
+#[cfg(windows)]
+pub fn start_server(adb_path: &str) -> Result<()> {
+    use std::{ffi::OsStr, mem, os::windows::ffi::OsStrExt, ptr};
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, WAIT_OBJECT_0},
+        System::Threading::{
+            CREATE_NO_WINDOW, CreateProcessW, GetExitCodeProcess, PROCESS_INFORMATION,
+            STARTUPINFOW, WaitForSingleObject,
+        },
+    };
+
+    let mut command_line: Vec<u16> = OsStr::new(&format!("\"{adb_path}\" start-server"))
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+
+    let mut startup_info: STARTUPINFOW = unsafe { mem::zeroed() };
+    startup_info.cb = mem::size_of::<STARTUPINFOW>() as u32;
+    let mut process_info: PROCESS_INFORMATION = unsafe { mem::zeroed() };
+
+    // SAFETY: all pointers are valid for the duration of the call, command_line is a mutable,
+    // null-terminated UTF-16 buffer as CreateProcessW requires.
+    let created = unsafe {
+        CreateProcessW(
+            ptr::null(),
+            command_line.as_mut_ptr(),
+            ptr::null(),
+            ptr::null(),
+            0, // bInheritHandles = FALSE
+            CREATE_NO_WINDOW,
+            ptr::null(),
+            ptr::null(),
+            &startup_info,
+            &mut process_info,
+        )
+    };
+    if created == 0 {
+        return Err(std::io::Error::last_os_error()).context("Failed to start ADB server");
+    }
+
+    // `adb start-server` returns once the daemon is up (or immediately if it already runs).
+    const START_SERVER_TIMEOUT_MS: u32 = 30_000;
+    // SAFETY: the handles come from a successful CreateProcessW call and are closed exactly once.
+    let exit_code = unsafe {
+        let mut exit_code: u32 = 1;
+        if WaitForSingleObject(process_info.hProcess, START_SERVER_TIMEOUT_MS) == WAIT_OBJECT_0 {
+            GetExitCodeProcess(process_info.hProcess, &mut exit_code);
+        }
+        CloseHandle(process_info.hThread);
+        CloseHandle(process_info.hProcess);
+        exit_code
+    };
+
+    if exit_code != 0 {
+        return Err(anyhow!("ADB start-server exited with code {exit_code}"));
+    }
+
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn start_server(adb_path: &str) -> Result<()> {
+    get_command(adb_path, &["start-server"])
+        .output()
+        .context("Failed to start ADB server")?;
+
+    Ok(())
+}
+
 pub fn kill_server(adb_path: &str) -> Result<()> {
     get_command(adb_path, &["kill-server"])
         .output()

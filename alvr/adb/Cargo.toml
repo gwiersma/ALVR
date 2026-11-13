@@ -14,3 +14,10 @@ alvr_session.workspace = true
 anyhow = "1"
 ureq = "3"
 zip = "8"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+] }

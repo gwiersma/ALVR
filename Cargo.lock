@@ -197,6 +197,7 @@ dependencies = [
  "alvr_system_info",
  "anyhow",
  "ureq",
+ "windows-sys 0.61.2",
  "zip",
 ]
 
