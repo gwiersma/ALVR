@@ -39,7 +39,7 @@ private:
     void InitVplEncode();
     void InitEncoder();
     // Returns true if any rate control parameter changed.
-    bool SetBitrate(uint64_t bitrateBps, bool forInit = false);
+    bool SetBitrate(uint64_t bitrateBps);
     mfxFrameSurface1* VplImportTexture(ID3D11Texture2D* texture);
     void LogImplementationInfo();
 
@@ -51,9 +51,6 @@ private:
     int m_bitrateInMBits;
     uint64_t m_appliedBitrateBps = 0;
     mfxU16 m_brcMultiplier = 0;
-    mfxU16 m_initMaxKbps = 0;
-    mfxU16 m_initTargetKbps = 0;
-    mfxU16 m_initBufferSizeInKB = 0;
 
     mfxU32 m_vplCodec;
     mfxU32 m_vplCodecProfile;
@@ -63,6 +60,8 @@ private:
     mfxU32 m_vplRateControlMode;
     DXGI_FORMAT m_dxColorFormat;
     mfxVideoParam m_vplEncodeParams = {};
+    mfxExtCodingOption m_vplCodingOption = {};
+    mfxExtBuffer* m_vplExtBuffers[1] = {};
 
     mfxLoader m_vplLoader = nullptr;
     mfxSession m_vplSession = nullptr;

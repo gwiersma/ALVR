@@ -88,18 +88,9 @@ void VideoEncoderVPL::Transmit(
         if (significant && SetBitrate(bitrateBps)) {
             m_appliedBitrateBps = bitrateBps;
 
-            // Keep the current sequence: a new one could change the SPS/PPS, which ALVR only sends
-            // to the client at stream start or when the client asks for an IDR.
-            mfxExtEncoderResetOption resetOption = {};
-            resetOption.Header.BufferId = MFX_EXTBUFF_ENCODER_RESET_OPTION;
-            resetOption.Header.BufferSz = sizeof(resetOption);
-            resetOption.StartNewSequence = MFX_CODINGOPTION_OFF;
-            mfxExtBuffer* extBuffers[] = { &resetOption.Header };
-            mfxVideoParam resetParams = m_vplEncodeParams;
-            resetParams.ExtParam = extBuffers;
-            resetParams.NumExtParam = 1;
-
-            mfxStatus sts = MFXVideoENCODE_Reset(m_vplSession, &resetParams);
+            // With HRD conformance off (see InitVplEncode), CBR allows changing TargetKbps with
+            // Reset without a new keyframe or sequence header.
+            mfxStatus sts = MFXVideoENCODE_Reset(m_vplSession, &m_vplEncodeParams);
             if (sts < MFX_ERR_NONE) {
                 // The encoder keeps running with its previous parameters.
                 VPL_WARN("failed to update bitrate to %llu bps (error %d)", bitrateBps, sts);
@@ -221,11 +212,18 @@ void VideoEncoderVPL::InitVplEncode() {
     m_vplEncodeParams.mfx.CodecProfile = m_vplCodecProfile;
     m_vplEncodeParams.mfx.TargetUsage = m_vplQualityPreset;
     m_vplEncodeParams.mfx.RateControlMethod = m_vplRateControlMode;
-    // Start at the maximum bitrate: the encoder picks its level (and tier) from the bitrate at
-    // Init, and Reset can't move to a higher level later (MFX_ERR_INCOMPATIBLE_VIDEO_PARAM).
-    // Lowering the bitrate with Reset always works. The first Transmit call applies the real
-    // bitrate.
-    SetBitrate(0, true);
+    // The real bitrate is applied with Reset on the first Transmit call.
+    SetBitrate(static_cast<uint64_t>(m_bitrateInMBits) * 1'000'000);
+    // Turn HRD conformance off: with it on, the encoder only allows bitrate changes in VBR mode
+    // (with a new keyframe and sequence header), and Reset fails in CBR mode with
+    // MFX_ERR_INCOMPATIBLE_VIDEO_PARAM. See "Dynamic Bitrate Change" in the oneVPL spec.
+    m_vplCodingOption.Header.BufferId = MFX_EXTBUFF_CODING_OPTION;
+    m_vplCodingOption.Header.BufferSz = sizeof(m_vplCodingOption);
+    m_vplCodingOption.NalHrdConformance = MFX_CODINGOPTION_OFF;
+    m_vplCodingOption.VuiNalHrdParameters = MFX_CODINGOPTION_OFF;
+    m_vplExtBuffers[0] = &m_vplCodingOption.Header;
+    m_vplEncodeParams.ExtParam = m_vplExtBuffers;
+    m_vplEncodeParams.NumExtParam = 1;
     // Low latency streaming: no B-frames, so every frame can be sent as soon as it is encoded.
     m_vplEncodeParams.mfx.GopRefDist = 1;
     m_vplEncodeParams.mfx.FrameInfo.FrameRateExtN = m_refreshRate;
@@ -251,20 +249,15 @@ void VideoEncoderVPL::InitVplEncode() {
         ERROR_THROW("query unsupported");
     }
 
-    // Query may have corrected the rate control fields. Use the corrected values as the limits
-    // for later Reset calls, since Reset can't grow the buffers allocated at Init.
     const mfxInfoMFX& mfx = m_vplEncodeParams.mfx;
     m_brcMultiplier = mfx.BRCParamMultiplier == 0 ? 1 : mfx.BRCParamMultiplier;
-    m_initMaxKbps = mfx.MaxKbps;
-    m_initTargetKbps = mfx.TargetKbps;
-    m_initBufferSizeInKB = mfx.BufferSizeInKB;
     VPL_INFO(
-        "rate control: target %u kbps, max %u kbps, buffer %u KB, multiplier %u, level %u",
+        "rate control: method %u, target %u kbps, multiplier %u, level %u, HRD conformance %u",
+        static_cast<unsigned>(mfx.RateControlMethod),
         static_cast<unsigned>(mfx.TargetKbps) * m_brcMultiplier,
-        static_cast<unsigned>(mfx.MaxKbps) * m_brcMultiplier,
-        static_cast<unsigned>(mfx.BufferSizeInKB) * m_brcMultiplier,
         static_cast<unsigned>(m_brcMultiplier),
-        static_cast<unsigned>(mfx.CodecLevel)
+        static_cast<unsigned>(mfx.CodecLevel),
+        static_cast<unsigned>(m_vplCodingOption.NalHrdConformance)
     );
 
     InitEncoder();
@@ -281,14 +274,10 @@ void VideoEncoderVPL::InitEncoder() {
     }
 }
 
-bool VideoEncoderVPL::SetBitrate(uint64_t bitrateBps, bool forInit) {
-    // TargetKbps, MaxKbps, BufferSizeInKB and InitialDelayInKB are 16-bit fields, so anything above
-    // ~65 Mbps silently wraps around. VPL scales all of them by BRCParamMultiplier.
-    //
-    // The multiplier is derived from a fixed maximum bitrate so it never changes between
-    // MFXVideoENCODE_Reset calls, and the encoder is initialized with rate control buffers sized
-    // for that maximum. Reset can only shrink those buffers; growing them past the size used at
-    // Init fails with MFX_ERR_INCOMPATIBLE_VIDEO_PARAM.
+bool VideoEncoderVPL::SetBitrate(uint64_t bitrateBps) {
+    // TargetKbps and MaxKbps are 16-bit fields, so anything above ~65 Mbps silently wraps around.
+    // VPL scales them by BRCParamMultiplier. The multiplier is derived from a fixed maximum
+    // bitrate (or taken from the encoder after Query) so it never changes between Reset calls.
     constexpr uint64_t MAX_U16 = 0xFFFF;
     constexpr uint64_t MAX_BITRATE_BPS = 1'000'000'000; // Same limit as AMF
     const uint64_t MULTIPLIER
@@ -297,60 +286,24 @@ bool VideoEncoderVPL::SetBitrate(uint64_t bitrateBps, bool forInit) {
     if (bitrateBps > MAX_BITRATE_BPS) {
         bitrateBps = MAX_BITRATE_BPS;
     }
-    if (bitrateBps < 1000 * MULTIPLIER) {
-        bitrateBps = 1000 * MULTIPLIER;
-    }
 
-    if (forInit) {
-        bitrateBps = MAX_BITRATE_BPS;
-    }
-
-    auto toField = [&](uint64_t kiloUnits) -> mfxU16 {
-        uint64_t scaled = kiloUnits / MULTIPLIER;
+    auto toField = [&](uint64_t kbps) -> mfxU16 {
+        uint64_t scaled = kbps / MULTIPLIER;
         if (scaled == 0) {
             scaled = 1;
         }
         return static_cast<mfxU16>(scaled > MAX_U16 ? MAX_U16 : scaled);
     };
 
-    // Size the buffer for about one frame, like the AMF and NVENC encoders, for low latency.
-    uint64_t bufferBps = forInit ? MAX_BITRATE_BPS : bitrateBps;
-    uint64_t refreshRate = m_refreshRate > 0 ? static_cast<uint64_t>(m_refreshRate) : 60;
-    uint64_t bufferKB = bufferBps / 8 / refreshRate * 11 / 10 / 1000;
-
     mfxInfoMFX& mfx = m_vplEncodeParams.mfx;
     mfxU16 targetKbps = toField(bitrateBps / 1000);
-    // CBR uses MaxKbps = TargetKbps. VBR (and the Init call, so Reset never has to grow it) uses
-    // the maximum.
-    bool useMax = forInit || mfx.RateControlMethod == MFX_RATECONTROL_VBR;
-    mfxU16 maxKbps = useMax ? toField(MAX_BITRATE_BPS / 1000) : targetKbps;
-    mfxU16 bufferSizeInKB = toField(bufferKB);
-    if (!forInit) {
-        // Never go above the bitrate the encoder accepted at Init, it would need a higher level.
-        if (m_initTargetKbps != 0 && targetKbps > m_initTargetKbps) {
-            targetKbps = m_initTargetKbps;
-            if (!useMax) {
-                maxKbps = targetKbps;
-            }
-        }
-        // Never grow past what the encoder accepted at Init. (For CBR, MaxKbps follows the
-        // target, so it is not limited here.)
-        if (useMax && m_initMaxKbps != 0 && maxKbps > m_initMaxKbps) {
-            maxKbps = m_initMaxKbps;
-        }
-        if (m_initBufferSizeInKB != 0 && bufferSizeInKB > m_initBufferSizeInKB) {
-            bufferSizeInKB = m_initBufferSizeInKB;
-        }
-    }
-
-    bool changed = mfx.BRCParamMultiplier != MULTIPLIER || mfx.TargetKbps != targetKbps
-        || mfx.MaxKbps != maxKbps || mfx.BufferSizeInKB != bufferSizeInKB;
+    bool changed = mfx.BRCParamMultiplier != MULTIPLIER || mfx.TargetKbps != targetKbps;
 
     mfx.BRCParamMultiplier = static_cast<mfxU16>(MULTIPLIER);
     mfx.TargetKbps = targetKbps;
-    mfx.MaxKbps = maxKbps;
-    mfx.BufferSizeInKB = bufferSizeInKB;
-    mfx.InitialDelayInKB = bufferSizeInKB;
+    if (mfx.RateControlMethod == MFX_RATECONTROL_VBR) {
+        mfx.MaxKbps = toField(MAX_BITRATE_BPS / 1000);
+    }
 
     return changed;
 }
