@@ -97,12 +97,27 @@ impl WiredConnection {
                     "ALVR client is not running".to_owned(),
                 ))
             }
-        } else if !commands::is_activity_resumed(&self.adb_path, &device_serial, &process_name)? {
-            Ok(WiredConnectionStatus::NotReady(
-                "ALVR client is paused".to_owned(),
-            ))
         } else {
-            Ok(WiredConnectionStatus::Ready)
+            match commands::is_activity_resumed(&self.adb_path, &device_serial, &process_name)? {
+                Some(true) => Ok(WiredConnectionStatus::Ready),
+                Some(false) => Ok(WiredConnectionStatus::NotReady(
+                    "ALVR client is paused".to_owned(),
+                )),
+                None => {
+                    // The client is running but in the background, e.g. after SteamVR was
+                    // restarted. Bring it back to the foreground if autolaunch is enabled.
+                    if client_autolaunch.is_some() {
+                        commands::start_application(&self.adb_path, &device_serial, &process_name)?;
+                        Ok(WiredConnectionStatus::NotReady(
+                            "Bringing ALVR client to the foreground".to_owned(),
+                        ))
+                    } else {
+                        Ok(WiredConnectionStatus::NotReady(
+                            "ALVR client is in the background".to_owned(),
+                        ))
+                    }
+                }
+            }
         }
     }
 }

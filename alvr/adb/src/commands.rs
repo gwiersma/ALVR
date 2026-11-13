@@ -93,11 +93,14 @@ pub fn get_process_id(
     Ok(Some(process_id))
 }
 
+/// Returns `Some(true)` if the activity is resumed, `Some(false)` if it is paused (for example
+/// because the headset was taken off), and `None` if dumpsys reports no state for it, which
+/// happens when the app is in the background (for example after SteamVR was restarted).
 pub fn is_activity_resumed(
     adb_path: &str,
     device_serial: &str,
     activity_name: &str,
-) -> Result<bool> {
+) -> Result<Option<bool>> {
     let output = get_command(
         adb_path,
         &[
@@ -124,12 +127,12 @@ pub fn is_activity_resumed(
             .split_once('=')
             .ok_or(anyhow!("Failed to split resumed state entry"))?;
         match value {
-            "true" => Ok(true),
-            "false" => Ok(false),
+            "true" => Ok(Some(true)),
+            "false" => Ok(Some(false)),
             _ => Err(anyhow!("Failed to parse resumed state value"))?,
         }
     } else {
-        Err(anyhow!("Failed to find resumed state line"))
+        Ok(None)
     }
 }
 
